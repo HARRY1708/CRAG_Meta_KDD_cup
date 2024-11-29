@@ -34,7 +34,7 @@ class EvaluationModel:
 
         if self.is_server:
             # initialize the model with vllm server
-            openai_api_key = "EMPTY"
+            openai_api_key = "sk-proj-utwYZXwGAgD2kpygKAQIT3BlbkFJB9U9lluAod4BZAWFCVG1"
             openai_api_base = self.vllm_server
             self.llm_client = OpenAI(
                 api_key=openai_api_key,

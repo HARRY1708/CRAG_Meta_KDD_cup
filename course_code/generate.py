@@ -102,7 +102,7 @@ if __name__ == "__main__":
                                  "google/gemma-2-2b-it",
                                  # can add more llm models here
                                  ])
-    parser.add_argument("--is_server", action="store_true", default=False,
+    parser.add_argument("--is_server", action="store_true", default=True,
                         help="Whether we use vLLM deployed on a server or offline inference.")
     parser.add_argument("--vllm_server", type=str, default="http://localhost:8088/v1",
                         help="URL of the vLLM server if is_server is True. The port number may vary.")
