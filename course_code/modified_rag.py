@@ -20,13 +20,13 @@ from tqdm import tqdm
 # ### CONFIG PARAMETERS ---
 
 # Define the number of context sentences to consider for generating an answer.
-NUM_CONTEXT_SENTENCES = 32
+NUM_CONTEXT_SENTENCES = 64
 
-NUM_CONTEXT_SENTENCES2 = 8
+NUM_CONTEXT_SENTENCES2 = 24
 # Set the maximum length for each context sentence (in characters).
 MAX_CONTEXT_SENTENCE_LENGTH = 1000
 # Set the maximum context references length (in characters).
-MAX_CONTEXT_REFERENCES_LENGTH = 8000
+MAX_CONTEXT_REFERENCES_LENGTH = 35000
 
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
@@ -46,7 +46,7 @@ SENTENTENCE_TRANSFORMER_BATCH_SIZE = 32 # TUNE THIS VARIABLE depending on the si
 class ChunkExtractor:
 
     @ray.remote
-    def _extract_chunks(self, interaction_id, html_source):
+    def _extract_chunks(self, interaction_id, html_source, page_time):
         """
         Extracts and returns chunks from given HTML source.
 
@@ -79,7 +79,7 @@ class ChunkExtractor:
         splits = text_splitter.split_documents(documents)
 
         # Convert the split result into a list of chunks
-        chunks = [split.page_content for split in splits]
+        chunks = [("Page Last Modified : " + str(page_time) + "\n" + split.page_content) for split in splits]
 
         # Return the interaction ID and the generated chunks
         return interaction_id, chunks
@@ -100,7 +100,8 @@ class ChunkExtractor:
             self._extract_chunks.remote(
                 self,
                 interaction_id=batch_interaction_ids[idx],
-                html_source=html_text["page_result"]
+                html_source=html_text["page_result"],
+                page_time = html_text["page_last_modified"]
             )
             for idx, search_results in enumerate(batch_search_results)
             for html_text in search_results
@@ -190,7 +191,7 @@ class MyRAGModel:
                                                   device=torch.device(
                 "cuda" if torch.cuda.is_available() else "cpu"
             ))
-        self.reranker = FlagReranker('BAAI/bge-reranker-v2-m3', use_fp16=True,device=torch.device(
+        self.reranker = FlagReranker('bge-reranker-v2-gemma', use_fp16=True,device=torch.device(
                 "cuda" if torch.cuda.is_available() else "cpu"
             ))
 
@@ -244,7 +245,31 @@ class MyRAGModel:
         """
         self.batch_size = AICROWD_SUBMISSION_BATCH_SIZE  
         return self.batch_size
+    
+    def extract_answer(self,input_str):
+        """
+        Extracts the text after 'Answer:' from the given input string.
 
+        Args:
+            input_str (str): The input string containing the "Answer:" field.
+
+        Returns:
+            str: The extracted answer text or an empty string if 'Answer:' is not found.
+        """
+        answer_keyword = "Answer:"
+        try:
+            # Find the position of "Answer:"
+            start_index = input_str.index(answer_keyword) + len(answer_keyword)
+            # Extract and strip any leading/trailing whitespace
+            # print("--------------- Output ---------------------")
+            # print(input_str)
+            # print(input_str[start_index:].strip())
+            return input_str[start_index:].strip()
+
+        except ValueError:
+            # Return empty string if "Answer:" is not found
+            return "I don't know"
+    
     def batch_generate_answer(self, batch: Dict[str, Any]) -> List[str]:
         """
         Generates answers for a batch of queries using associated (pre-cached) search results and query times.
@@ -342,9 +367,9 @@ class MyRAGModel:
                 top_p=0.25,  # Float that controls the cumulative probability of the top tokens to consider.
                 temperature=0,  # randomness of the sampling
                 # skip_special_tokens=True,  # Whether to skip special tokens in the output.
-                max_tokens=25,  # Maximum number of tokens to generate per output sequence.
+                max_tokens=200,  # Maximum number of tokens to generate per output sequence.
             )
-            answers = [response.choices[0].message.content]
+            answers = [self.extract_answer(response.choices[0].message.content)]
         else:
             responses = self.llm.generate(
                 formatted_prompts,
@@ -353,16 +378,16 @@ class MyRAGModel:
                     top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
                     temperature=0.1,  # randomness of the sampling
                     skip_special_tokens=True,  # Whether to skip special tokens in the output.
-                    max_tokens=50,  # Maximum number of tokens to generate per output sequence.
+                    max_tokens=200,  # Maximum number of tokens to generate per output sequence.
                 ),
                 use_tqdm=False
             )
             answers = []
             for response in responses:
-                answers.append(response.outputs[0].text)
+                answers.append(self.extract_answer(response.outputs[0].text))
 
         return answers
-
+    
     def format_prompts(self, queries, query_times, batch_retrieval_results=[]):
         """
         Formats queries, corresponding query_times and retrieval results using the chat_template of the model.
@@ -372,12 +397,138 @@ class MyRAGModel:
         - query_times (List[str]): A list of query_time strings corresponding to each query.
         - batch_retrieval_results (List[str])
         """        
-        system_prompt = '''You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible.
-    ## Strictly follow these Instructions:
-    1. If the references do not contain the necessary information to answer the question, respond with 'Invalid question' if the Question seems to be a false premise or "I dont know" if the Answer is not there in the references. 
-    2. There is no need to explain the reasoning behind your answers , give exact and to the point in the answer . No need to repeat the question or give reasoning 
-    3. Read the references carefully and find the answer & output the to the point answer verbatim from the references. Do not use any other information'''
+    #     system_prompt = '''You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible.
+    # ## Strictly follow these Instructions:
+    # 1. If the references do not contain the necessary information to answer the question, respond with only 'i don't' know'.
+    # 2. If the Question seems to be a false premise , output "invalid question". like Questions that have a false proposition or assumption; for example, What's the name of Taylor Swift's rap album before she transitioned to pop? (Taylor Swift didn't release any rap album.)
+    # 3. There is no need to explain the reasoning behind your answers , give exact and to the point in the answer . No need to repeat the question or give reasoning 
+    # 4. Read the references carefully and find the answer only from provided references & output the to the point answer verbatim from the references. Do not use any other information'''
+        system_prompt = '''You are provided with a question and various references. Your task is to answer the question based on the references, categorizing it into the appropriate type, and reasoning step-by-step to reach the final answer.
+
+        ## Instructions (Read it Very Carefully):
+        1. Categorize the Question: First, determine the type of question from the following categories:
+           - Simple Question : Questions asking for simple facts
+           - Simple Question with Conditions : Questions asking for simple facts with some given conditions, such as stock price on a certain date and a director's recent movies in a certain genre.
+           - Set Question : Questions that expect a set of entities or objects as the answer
+           - Comparison Question : Questions that may compare two entities, such as who started performing earlier, Adele or Ed Sheeran?
+           - Aggregation Question : Questions that may need aggregation of retrieval results to answer, for example, how many Oscar awards did Meryl Streep win?
+           - Multi-hop Question : Questions that may require chaining multiple pieces of information to compose the answer, such as who acted in Ang Lee's latest movie?
+           - Post-processing Question : Questions that need reasoning or processing of the retrieved information to obtain the answer
+           - False Premise Question :  Questions that have a false proposition or assumption; for example, What's the name of Taylor Swift's rap album before she transitioned to pop? (Taylor Swift didn't release any rap album.)
+
+        2. Address Recent or Fast-Changing Information:
+           - For questions asking about recent or fast-changing information, use the query time provided (time of asking query) and the "Page Last Modified" for each reference chunk.
+           - Only use the reference chunks with modification times closest to the query time.
         
+        3. Multi-Step Reasoning:
+           - Some questions might not have a direct answer in the references and will require combining multiple pieces of information through logical reasoning.
+           - Always connect intermediate steps explicitly to arrive at the final answer.
+        
+        4. Provide Chain-of-Thought Reasoning: Use logical reasoning to connect the information in the references to the final answer.
+        
+        5. Evaluate References: Use only the provided references to answer the question. If the references do not provide sufficient information or no information to deduce the answer, respond with:
+           Answer: I don't know
+
+        6. Validate Premises: If the question is based on a false premise, respond with:
+           Answer: Invalid question
+           
+        7. Answer Format: Always provide the output in the following structure:
+        Question Type: <type>
+        Reasoning: <step-by-step reasoning>
+        Answer: <final answer>
+
+        ### Examples:
+
+        1. Simple Question
+           Question: Who wrote *To Kill a Mockingbird*?
+           References: ["Harper Lee wrote *To Kill a Mockingbird*."]
+
+           Output:
+           Question Type: Simple Question
+           Reasoning: The references state that Harper Lee is the author.
+           Answer: Harper Lee
+
+        2. Simple Question with Conditions
+           Question: What was the closing price of Tesla stock on June 1, 2021?
+           References: ["On June 1, 2021, Tesla's closing stock price was $605.13."]
+
+           Output:
+           Question Type: Simple Question with Conditions
+           Reasoning: The references show the stock price on June 1, 2021, was $605.13.
+           Answer: $605.13
+
+        3. Set Question
+           Question: List all the Nobel Peace Prize winners from 2000 to 2010.
+           References: ["Winners from 2000 to 2010 are X, Y, Z."]
+
+           Output:
+           Question Type: Set Question
+           Reasoning: The references list winners for each year in that range: X, Y, Z.
+           Answer: X, Y, Z
+
+        4. Comparison Question
+           Question: Which country is larger in area, Canada or the United States?
+           References: ["Canada is 9.98 million km²; the U.S. is 9.83 million km²."]
+
+           Output:
+           Question Type: Comparison Question
+           Reasoning: The references show Canada is 9.98 million km² and the U.S. is 9.83 million km².
+           Answer: Canada
+
+        5. Aggregation Question
+           Question: How many goals did Lionel Messi score in the 2019 season?
+           References: ["Messi scored 25 in the league, 10 in the Champions League, and 5 in other tournaments."]
+
+           Output:
+           Question Type: Aggregation Question
+           Reasoning: The references indicate Messi scored 25 in the league, 10 in the Champions League, and 5 in other tournaments, totaling 40 goals.
+           Answer: 40 goals
+
+        6. Multi-hop Question
+           Question: Who is the current CEO of the company that owns Instagram?
+           References: ["Instagram is owned by Meta.", "Meta's CEO is Mark Zuckerberg."]
+
+           Output:
+           Question Type: Multi-hop Question
+           Reasoning: Instagram is owned by Meta, whose CEO is Mark Zuckerberg.
+           Answer: Mark Zuckerberg
+
+        7. Post-processing Question
+           Question: If I have 250 apples and distribute them equally among 5 baskets, how many apples will be in each basket?
+           References: ["Divide 250 by 5 to get 50."]
+
+           Output:
+           Question Type: Post-processing Question
+           Reasoning: Divide 250 by 5. The result is 50.
+           Answer: 50
+
+        8. False Premise Question
+           Question: When did the Roman Empire land on the Moon?
+           References: ["The Roman Empire did not exist during the era of space exploration."]
+
+           Output:
+           Question Type: False Premise Question
+           Reasoning: The Roman Empire did not exist during the space exploration era.
+           Answer: Invalid question
+        
+        9. Fast-Changing Information Question
+           Question: What was the closing price of Tesla stock yesterday?
+           Current Time: 02/28/2024, 08:30:00 PT
+           References:
+           - ["Tesla stock closed at $210.35 on February 27, 2024. (Page Last Modified: 02/28/2024, 06:00:00 PT)"]
+           - ["Tesla stock closed at $206.35 on February 26, 2024. (Page Last Modified: 02/27/2024, 05:00:00 PT)"]
+
+           Output:
+           Question Type: Simple Question with Conditions
+           Reasoning: The query asks for Tesla's closing price on February 27, 2024. The reference modified on 02/28/2024 at 06:00:00 PT provides the latest data and states the closing price was $210.35.
+           Answer: $210.35
+           
+        ### Important Notes:
+        - If references are insufficient to answer, respond with:
+          Answer: I don't know
+        - Always adhere strictly to this format.
+        '''
+
         formatted_prompts = []
 
         for _idx, query in enumerate(queries):
@@ -399,9 +550,10 @@ class MyRAGModel:
             user_message 
             user_message += f"Strictly use only the references listed above and no other information, answer the following question: \n"
             user_message += f"Current Time: {query_time}\n"
-            user_message += f"Question: {query}\n Answer : "
+            user_message += f"Question: {query}\n Question Type: "
 
             if self.is_server:
+                # print(user_message)
                 # there is no need to wrap the messages into chat when using the server
                 # because we use the chat API: chat.completions.create
                 formatted_prompts.append(
