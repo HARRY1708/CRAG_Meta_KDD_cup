@@ -10,12 +10,14 @@ from blingfire import text_to_sentences_and_offsets
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_text_splitters import HTMLSectionSplitter
 from FlagEmbedding import BGEM3FlagModel, FlagReranker
+
 from langchain.schema import Document
 from openai import OpenAI
 
 from tqdm import tqdm
+
+# ### CONFIG PARAMETERS ---
 
 # ### CONFIG PARAMETERS ---
 
@@ -145,7 +147,7 @@ class ChunkExtractor:
 
         return chunks, chunk_interaction_ids
 
-class MyRAGModel:
+class RAGModel:
     """
     An example RAGModel for the KDDCup 2024 Meta CRAG Challenge
     which includes all the key components of a RAG lifecycle.
@@ -181,12 +183,6 @@ class MyRAGModel:
             self.tokenizer = self.llm.get_tokenizer()
 
         # Load a sentence transformer model optimized for sentence embeddings, using CUDA if available.
-        # self.sentence_model = BGEM3FlagModel('BAAI/bge-m3',  
-        #     use_fp16=True,
-        #     device=torch.device(
-        #         "cuda" if torch.cuda.is_available() else "cpu"
-        #     )
-        # )
         self.sentence_model = SentenceTransformer('sentence-transformers/multi-qa-distilbert-cos-v1',
                                                   device=torch.device(
                 "cuda" if torch.cuda.is_available() else "cpu"
@@ -194,6 +190,7 @@ class MyRAGModel:
         self.reranker = FlagReranker('BAAI/bge-reranker-v2-m3', use_fp16=True,device=torch.device(
                 "cuda" if torch.cuda.is_available() else "cpu"
             ))
+
 
     def calculate_embeddings(self, sentences):
         """
@@ -209,20 +206,10 @@ class MyRAGModel:
             np.ndarray: An array of normalized embeddings for the given sentences.
 
         """
-        # print(sentences[:5])
-        # print(len(sentences))
-        # Ensure chunks is a list of strings
-        if not isinstance(sentences, list):
-            raise ValueError(f"Expected chunks to be a list of strings, got {type(sentences)}")
-        if not all(isinstance(chunk, str) for chunk in sentences):
-            raise ValueError("All elements in chunks must be strings.")
-        # embeddings = self.sentence_model.encode(
-        #     sentences,
-        #     batch_size=SENTENTENCE_TRANSFORMER_BATCH_SIZE
-        # )['dense_vecs']
         embeddings = self.sentence_model.encode(
-            sentences,
-            batch_size=SENTENTENCE_TRANSFORMER_BATCH_SIZE
+            sentences=sentences,
+            normalize_embeddings=True,
+            batch_size=SENTENTENCE_TRANSFORMER_BATCH_SIZE,
         )
         # Note: There is an opportunity to parallelize the embedding generation across 4 GPUs
         #       but sentence_model.encode_multi_process seems to interefere with Ray
@@ -245,31 +232,7 @@ class MyRAGModel:
         """
         self.batch_size = AICROWD_SUBMISSION_BATCH_SIZE  
         return self.batch_size
-    
-    def extract_answer(self,input_str):
-        """
-        Extracts the text after 'Answer:' from the given input string.
 
-        Args:
-            input_str (str): The input string containing the "Answer:" field.
-
-        Returns:
-            str: The extracted answer text or an empty string if 'Answer:' is not found.
-        """
-        answer_keyword = "Answer:"
-        try:
-            # Find the position of "Answer:"
-            start_index = input_str.index(answer_keyword) + len(answer_keyword)
-            # Extract and strip any leading/trailing whitespace
-            # print("--------------- Output ---------------------")
-            # print(input_str)
-            # print(input_str[start_index:].strip())
-            return input_str[start_index:].strip()
-
-        except ValueError:
-            # Return empty string if "Answer:" is not found
-            return "I don't know"
-    
     def batch_generate_answer(self, batch: Dict[str, Any]) -> List[str]:
         """
         Generates answers for a batch of queries using associated (pre-cached) search results and query times.
@@ -353,7 +316,6 @@ class MyRAGModel:
             ]
             
             batch_retrieval_results.append(reranked_results)
-            
         # Prepare formatted prompts from the LLM        
         formatted_prompts = self.format_prompts(queries, query_times, batch_retrieval_results)
 
@@ -364,12 +326,12 @@ class MyRAGModel:
                 model=self.llm_name,
                 messages=formatted_prompts[0],
                 n=1,  # Number of output sequences to return for each prompt.
-                top_p=0.25,  # Float that controls the cumulative probability of the top tokens to consider.
-                temperature=0,  # randomness of the sampling
+                top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
+                temperature=0.1,  # randomness of the sampling
                 # skip_special_tokens=True,  # Whether to skip special tokens in the output.
-                max_tokens=200,  # Maximum number of tokens to generate per output sequence.
+                max_tokens=50,  # Maximum number of tokens to generate per output sequence.
             )
-            answers = [self.extract_answer(response.choices[0].message.content)]
+            answers = [response.choices[0].message.content]
         else:
             responses = self.llm.generate(
                 formatted_prompts,
@@ -378,16 +340,16 @@ class MyRAGModel:
                     top_p=0.9,  # Float that controls the cumulative probability of the top tokens to consider.
                     temperature=0.1,  # randomness of the sampling
                     skip_special_tokens=True,  # Whether to skip special tokens in the output.
-                    max_tokens=200,  # Maximum number of tokens to generate per output sequence.
+                    max_tokens=50,  # Maximum number of tokens to generate per output sequence.
                 ),
                 use_tqdm=False
             )
             answers = []
             for response in responses:
-                answers.append(self.extract_answer(response.outputs[0].text))
+                answers.append(response.outputs[0].text)
 
         return answers
-    
+
     def format_prompts(self, queries, query_times, batch_retrieval_results=[]):
         """
         Formats queries, corresponding query_times and retrieval results using the chat_template of the model.
@@ -397,163 +359,32 @@ class MyRAGModel:
         - query_times (List[str]): A list of query_time strings corresponding to each query.
         - batch_retrieval_results (List[str])
         """        
-    #     system_prompt = '''You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible.
-    # ## Strictly follow these Instructions:
-    # 1. If the references do not contain the necessary information to answer the question, respond with only 'i don't' know'.
-    # 2. If the Question seems to be a false premise , output "invalid question". like Questions that have a false proposition or assumption; for example, What's the name of Taylor Swift's rap album before she transitioned to pop? (Taylor Swift didn't release any rap album.)
-    # 3. There is no need to explain the reasoning behind your answers , give exact and to the point in the answer . No need to repeat the question or give reasoning 
-    # 4. Read the references carefully and find the answer only from provided references & output the to the point answer verbatim from the references. Do not use any other information'''
-        system_prompt = '''You are provided with a question and various references. Your task is to answer the question based on the references, categorizing it into the appropriate type, and reasoning step-by-step to reach the final answer.
-
-        ## Instructions (Read it Very Carefully):
-        1. Categorize the Question: First, determine the type of question from the following categories:
-           - Simple Question : Questions asking for simple facts
-           - Simple Question with Conditions : Questions asking for simple facts with some given conditions, such as stock price on a certain date and a director's recent movies in a certain genre.
-           - Set Question : Questions that expect a set of entities or objects as the answer
-           - Comparison Question : Questions that may compare two entities, such as who started performing earlier, Adele or Ed Sheeran?
-           - Aggregation Question : Questions that may need aggregation of retrieval results to answer, for example, how many Oscar awards did Meryl Streep win?
-           - Multi-hop Question : Questions that may require chaining multiple pieces of information to compose the answer, such as who acted in Ang Lee's latest movie?
-           - Post-processing Question : Questions that need reasoning or processing of the retrieved information to obtain the answer
-           - False Premise Question :  Questions that have a false proposition or assumption; for example, What's the name of Taylor Swift's rap album before she transitioned to pop? (Taylor Swift didn't release any rap album.)
-
-        2. Address Recent or Fast-Changing Information:
-           - For questions asking about recent or fast-changing information, use the query time provided (time of asking query) and the "Page Last Modified" for each reference chunk.
-           - Only use the reference chunks with modification times closest to the query time.
-        
-        3. Multi-Step Reasoning:
-           - Some questions might not have a direct answer in the references and will require combining multiple pieces of information through logical reasoning.
-           - Always connect intermediate steps explicitly to arrive at the final answer.
-        
-        4. Provide Chain-of-Thought Reasoning: Use logical reasoning to connect the information in the references to the final answer.
-        
-        5. Evaluate References: Use only the provided references to answer the question. If the references do not provide sufficient information or no information to deduce the answer, respond with:
-           Answer: I don't know
-
-        6. Validate Premises: If the question is based on a false premise, respond with:
-           Answer: Invalid question
-           
-        7. Answer Format: Always provide the output in the following structure:
-        Question Type: <type>
-        Reasoning: <step-by-step reasoning>
-        Answer: <final answer>
-
-        ### Examples:
-
-        1. Simple Question
-           Question: Who wrote *To Kill a Mockingbird*?
-           References: ["Harper Lee wrote *To Kill a Mockingbird*."]
-
-           Output:
-           Question Type: Simple Question
-           Reasoning: The references state that Harper Lee is the author.
-           Answer: Harper Lee
-
-        2. Simple Question with Conditions
-           Question: What was the closing price of Tesla stock on June 1, 2021?
-           References: ["On June 1, 2021, Tesla's closing stock price was $605.13."]
-
-           Output:
-           Question Type: Simple Question with Conditions
-           Reasoning: The references show the stock price on June 1, 2021, was $605.13.
-           Answer: $605.13
-
-        3. Set Question
-           Question: List all the Nobel Peace Prize winners from 2000 to 2010.
-           References: ["Winners from 2000 to 2010 are X, Y, Z."]
-
-           Output:
-           Question Type: Set Question
-           Reasoning: The references list winners for each year in that range: X, Y, Z.
-           Answer: X, Y, Z
-
-        4. Comparison Question
-           Question: Which country is larger in area, Canada or the United States?
-           References: ["Canada is 9.98 million km²; the U.S. is 9.83 million km²."]
-
-           Output:
-           Question Type: Comparison Question
-           Reasoning: The references show Canada is 9.98 million km² and the U.S. is 9.83 million km².
-           Answer: Canada
-
-        5. Aggregation Question
-           Question: How many goals did Lionel Messi score in the 2019 season?
-           References: ["Messi scored 25 in the league, 10 in the Champions League, and 5 in other tournaments."]
-
-           Output:
-           Question Type: Aggregation Question
-           Reasoning: The references indicate Messi scored 25 in the league, 10 in the Champions League, and 5 in other tournaments, totaling 40 goals.
-           Answer: 40 goals
-
-        6. Multi-hop Question
-           Question: Who is the current CEO of the company that owns Instagram?
-           References: ["Instagram is owned by Meta.", "Meta's CEO is Mark Zuckerberg."]
-
-           Output:
-           Question Type: Multi-hop Question
-           Reasoning: Instagram is owned by Meta, whose CEO is Mark Zuckerberg.
-           Answer: Mark Zuckerberg
-
-        7. Post-processing Question
-           Question: If I have 250 apples and distribute them equally among 5 baskets, how many apples will be in each basket?
-           References: ["Divide 250 by 5 to get 50."]
-
-           Output:
-           Question Type: Post-processing Question
-           Reasoning: Divide 250 by 5. The result is 50.
-           Answer: 50
-
-        8. False Premise Question
-           Question: When did the Roman Empire land on the Moon?
-           References: ["The Roman Empire did not exist during the era of space exploration."]
-
-           Output:
-           Question Type: False Premise Question
-           Reasoning: The Roman Empire did not exist during the space exploration era.
-           Answer: Invalid question
-        
-        9. Fast-Changing Information Question
-           Question: What was the closing price of Tesla stock yesterday?
-           Current Time: 02/28/2024, 08:30:00 PT
-           References:
-           - ["Tesla stock closed at $210.35 on February 27, 2024. (Page Last Modified: 02/28/2024, 06:00:00 PT)"]
-           - ["Tesla stock closed at $206.35 on February 26, 2024. (Page Last Modified: 02/27/2024, 05:00:00 PT)"]
-
-           Output:
-           Question Type: Simple Question with Conditions
-           Reasoning: The query asks for Tesla's closing price on February 27, 2024. The reference modified on 02/28/2024 at 06:00:00 PT provides the latest data and states the closing price was $210.35.
-           Answer: $210.35
-           
-        ### Important Notes:
-        - If references are insufficient to answer, respond with:
-          Answer: I don't know
-        - Always adhere strictly to this format.
-        '''
-
+        system_prompt = "You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible. If the references do not contain the necessary information to answer the question, respond with 'I don't know'. There is no need to explain the reasoning behind your answers."
         formatted_prompts = []
 
         for _idx, query in enumerate(queries):
             query_time = query_times[_idx]
             retrieval_results = batch_retrieval_results[_idx]
-            
+
             user_message = ""
             references = ""
+            
             if len(retrieval_results) > 0:
                 references += "# References \n"
                 # Format the top sentences as references in the model's prompt template.
                 for _snippet_idx, snippet in enumerate(retrieval_results):
-                    references += f"# Reference  {_snippet_idx} \n - {snippet.strip()}\n"
+                    references += f"- {snippet.strip()}\n"
             
             references = references[:MAX_CONTEXT_REFERENCES_LENGTH]
             # Limit the length of references to fit the model's input size.
 
-            user_message += f"{references}\n------ END OF REFERENCES \n\n"
+            user_message += f"{references}\n------\n\n"
             user_message 
-            user_message += f"Strictly use only the references listed above and no other information, answer the following question: \n"
+            user_message += f"Using only the references listed above, answer the following question: \n"
             user_message += f"Current Time: {query_time}\n"
-            user_message += f"Question: {query}\n Question Type: "
+            user_message += f"Question: {query}\n"
 
             if self.is_server:
-                # print(user_message)
                 # there is no need to wrap the messages into chat when using the server
                 # because we use the chat API: chat.completions.create
                 formatted_prompts.append(

@@ -14,7 +14,9 @@ from langchain_text_splitters import HTMLSectionSplitter
 from FlagEmbedding import BGEM3FlagModel, FlagReranker
 from langchain.schema import Document
 from openai import OpenAI
-
+from datetime import datetime
+from dateutil import parser
+from pytz import timezone, UTC
 from tqdm import tqdm
 
 # ### CONFIG PARAMETERS ---
@@ -84,7 +86,30 @@ class ChunkExtractor:
         # Return the interaction ID and the generated chunks
         return interaction_id, chunks
 
-    def extract_chunks(self, batch_interaction_ids, batch_search_results):
+
+    def get_time_difference(self,q1, q2):
+        # Define the formats of the input timestamps
+        format_q1 = "%m/%d/%Y, %H:%M:%S %Z"  # Correct format for q1
+        format_q2 = "%a, %d %b %Y %H:%M:%S %Z"  # Format for q2
+
+        # Define the time zones
+        pt_zone = timezone("US/Pacific")
+        gmt_zone = UTC  # GMT is equivalent to UTC
+
+        # Parse the timestamps with their respective time zones
+        try:
+            dt_q1 = parser.parse(q1).replace(tzinfo=pt_zone)
+            dt_q2 = parser.parse(q2).replace(tzinfo=gmt_zone)
+        except ValueError as e:
+            return f"Error parsing date: {e}"
+
+        # Calculate the difference
+        time_difference = dt_q1 - dt_q2
+
+        # Return the difference in various formats
+        return int(time_difference.total_seconds() / 3600)
+
+    def extract_chunks(self, batch_interaction_ids, batch_search_results,query_mask,query_times):
         """
         Extracts chunks from given batch search results using parallel processing with Ray.
 
@@ -96,16 +121,62 @@ class ChunkExtractor:
             Tuple[np.ndarray, np.ndarray]: A tuple containing an array of chunks and an array of corresponding interaction IDs.
         """
         # Setup parallel chunk extraction using ray remote
-        ray_response_refs = [
-            self._extract_chunks.remote(
-                self,
-                interaction_id=batch_interaction_ids[idx],
-                html_source=html_text["page_result"],
-                page_time = html_text["page_last_modified"]
-            )
-            for idx, search_results in enumerate(batch_search_results)
-            for html_text in search_results
-        ]
+        ray_response_refs = []
+
+        for idx, search_results in enumerate(batch_search_results):
+            if query_mask[idx]=='real-time' or query_mask[idx]=='fast-changing':  # Apply filtering based on query_mask
+                query_time = query_times[idx]
+                print("Query Time:", query_time)
+                nearest_page = None
+                nearest_time_difference = 24
+                if query_mask[idx]=='fast-changing':
+                    nearest_time_difference = 168
+                
+
+                for html_text in search_results:
+                    page_time = html_text.get("page_last_modified")
+                    print("Page Time:", page_time)
+
+                    if not page_time:  # If page_time is empty or None, include it in refs
+                        print("Page Time is empty, adding to refs")
+                        ray_response_refs.append(
+                            self._extract_chunks.remote(
+                                self,
+                                interaction_id=batch_interaction_ids[idx],
+                                html_source=html_text["page_result"],
+                                page_time=page_time,  # Can pass None or an empty string
+                            )
+                        )
+                        continue  # Skip further processing for this page
+
+                    try:
+                        time_difference = self.get_time_difference(query_time, page_time)
+                        print("Time Difference:", time_difference)
+                        if 0 <= time_difference < nearest_time_difference:
+                            nearest_time_difference = time_difference
+                            nearest_page = html_text
+                    except ValueError:
+                        continue  # Skip if time parsing fails
+
+                if nearest_page:
+                    ray_response_refs.append(
+                        self._extract_chunks.remote(
+                            self,
+                            interaction_id=batch_interaction_ids[idx],
+                            html_source=nearest_page["page_result"],
+                            page_time=nearest_page["page_last_modified"],
+                        )
+                    )
+            else:  # No filtering, process all pages
+                for html_text in search_results:
+                    ray_response_refs.append(
+                        self._extract_chunks.remote(
+                            self,
+                            interaction_id=batch_interaction_ids[idx],
+                            html_source=html_text["page_result"],
+                            page_time=html_text["page_last_modified"],
+                        )
+                    )
 
         # Wait until all sentence extractions are complete
         # and collect chunks for every interaction_id separately
@@ -246,6 +317,49 @@ class MyRAGModel:
         self.batch_size = AICROWD_SUBMISSION_BATCH_SIZE  
         return self.batch_size
     
+    def classification(self, query):
+        # Define the prompt with clear definitions and examples
+        prompt = (
+            "Classify the following query into one of the temporal dynamics categories:\n"
+            "- Real-time: Requires information that changes moment to moment (e.g., current stock prices).\n"
+            "- Fast-changing: Information changes event to event, such as daily or weekly updates (e.g., sports match outcomes).\n"
+            "- Slow-changing: Information evolves gradually over months or years (e.g., product features).\n"
+            "- Stable: Information remains largely unchanged over long periods (e.g., historical facts).\n\n"
+            "Examples:\n"
+            "1. Query: \"Can you provide me with the most recent stock price of CURO today?\"\n"
+            "   Classification: Real-time\n"
+            "2. Query: \"What was the outcome of Sheffield Utd's most recent match in the Premier League?\"\n"
+            "   Classification: Fast-changing\n"
+            "3. Query: \"What are the major features of the iPhone 15?\"\n"
+            "   Classification: Slow-changing\n"
+            "4. Query: \"What is the chemical formula for water?\"\n"
+            "   Classification: Stable\n\n"
+            f"Now, classify the following query:\n"
+            f"Query: \"{query}\"\n"
+            "Classification: "
+        )
+        print(query)
+        if self.is_server:
+            response = self.llm_client.chat.completions.create(
+                model=self.llm_name,
+                messages=[{"role": "user", "content": prompt}],
+                n=1,
+                top_p=0.25,
+                temperature=0,
+                max_tokens=5,
+            )
+
+            answer = response.choices[0].message.content
+            if 'real-time' in answer.lower() :
+                return 'real-time'
+            elif 'fast-changing' in answer.lower() :
+                return 'fast-changing'
+            else:
+                return 'stable'
+        else:
+            raise ValueError("Server mode is not enabled.")
+        
+        
     def extract_answer(self,input_str):
         """
         Extracts the text after 'Answer:' from the given input string.
@@ -298,10 +412,12 @@ class MyRAGModel:
         queries = batch["query"]
         batch_search_results = batch["search_results"]
         query_times = batch["query_time"]
-
+        
+        query_mask = [self.classification(query) for query in queries]
+        print(query_mask)
         # Chunk all search results using ChunkExtractor
         chunks, chunk_interaction_ids = self.chunk_extractor.extract_chunks(
-            batch_interaction_ids, batch_search_results
+            batch_interaction_ids, batch_search_results,query_mask,query_times
         )
 
         # Calculate all chunk embeddings
@@ -322,14 +438,14 @@ class MyRAGModel:
             # Filter out the said chunks and corresponding embeddings
             relevant_chunks = np.array([chunk for i, chunk in enumerate(chunks) if relevant_chunks_mask[i]])
             relevant_chunks_embeddings = np.array([embedding for i, embedding in enumerate(chunk_embeddings) if relevant_chunks_mask[i]])
-            
+
 
 #             relevant_pairs = [[query,i] for i in relevant_chunks]
-            
+
 #             cosine_scores = self.sentence_model.compute_score(relevant_pairs, 
 #                           max_passage_length=512, # a smaller max length leads to a lower latency
 #                           weights_for_different_modes=[0.6, 0.4,0])
-            
+
             # Calculate cosine similarity between query and chunk embeddings,
             cosine_scores = (relevant_chunks_embeddings @ query_embedding.T)
             # print(cosine_scores)

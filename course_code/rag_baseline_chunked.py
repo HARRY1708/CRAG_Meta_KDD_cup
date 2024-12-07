@@ -8,11 +8,9 @@ import torch
 import vllm
 from blingfire import text_to_sentences_and_offsets
 from bs4 import BeautifulSoup
-# from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_text_splitters import HTMLSectionSplitter
-from langchain.vectorstores import Chroma
-from FlagEmbedding import BGEM3FlagModel
+from FlagEmbedding import BGEM3FlagModel, FlagReranker
 from langchain.schema import Document
 from openai import OpenAI
 
@@ -20,15 +18,19 @@ from tqdm import tqdm
 
 # ### CONFIG PARAMETERS ---
 
+# ### CONFIG PARAMETERS ---
+
 # Define the number of context sentences to consider for generating an answer.
-NUM_CONTEXT_SENTENCES = 20
+NUM_CONTEXT_SENTENCES = 64
+
+NUM_CONTEXT_SENTENCES2 = 32
 # Set the maximum length for each context sentence (in characters).
-MAX_CONTEXT_SENTENCE_LENGTH = 1000
+MAX_CONTEXT_SENTENCE_LENGTH = 1500
 # Set the maximum context references length (in characters).
-MAX_CONTEXT_REFERENCES_LENGTH = 40000
+MAX_CONTEXT_REFERENCES_LENGTH = 35000
 
 CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 50
+CHUNK_OVERLAP = 200
 
 # Batch size you wish the evaluators will use to call the `batch_generate_answer` function
 AICROWD_SUBMISSION_BATCH_SIZE = 1 # TUNE THIS VARIABLE depending on the number of GPUs you are requesting and the size of your model.
@@ -45,7 +47,7 @@ SENTENTENCE_TRANSFORMER_BATCH_SIZE = 32 # TUNE THIS VARIABLE depending on the si
 class ChunkExtractor:
 
     @ray.remote
-    def _extract_chunks(self, interaction_id, html_source):
+    def _extract_chunks(self, interaction_id, html_source, page_time):
         """
         Extracts and returns chunks from given HTML source.
 
@@ -78,7 +80,7 @@ class ChunkExtractor:
         splits = text_splitter.split_documents(documents)
 
         # Convert the split result into a list of chunks
-        chunks = [split.page_content for split in splits]
+        chunks = [("Page Last Modified : " + str(page_time) + "\n" + split.page_content) for split in splits]
 
         # Return the interaction ID and the generated chunks
         return interaction_id, chunks
@@ -99,7 +101,8 @@ class ChunkExtractor:
             self._extract_chunks.remote(
                 self,
                 interaction_id=batch_interaction_ids[idx],
-                html_source=html_text["page_result"]
+                html_source=html_text["page_result"],
+                page_time = html_text["page_last_modified"]
             )
             for idx, search_results in enumerate(batch_search_results)
             for html_text in search_results
@@ -143,7 +146,7 @@ class ChunkExtractor:
 
         return chunks, chunk_interaction_ids
 
-class MyRAGModel:
+class RAGModel:
     """
     An example RAGModel for the KDDCup 2024 Meta CRAG Challenge
     which includes all the key components of a RAG lifecycle.
@@ -151,7 +154,6 @@ class MyRAGModel:
     def __init__(self, llm_name="meta-llama/Llama-3.2-3B-Instruct", is_server=False, vllm_server=None):
         self.initialize_models(llm_name, is_server, vllm_server)
         self.chunk_extractor = ChunkExtractor()
-        self.vector_db = 
 
     def initialize_models(self, llm_name, is_server, vllm_server):
         self.llm_name = llm_name
@@ -160,7 +162,7 @@ class MyRAGModel:
 
         if self.is_server:
             # initialize the model with vllm server
-            openai_api_key = "sk-proj-SFGbEuYv6K5tIDJ70Ym7T3BlbkFJQ6NFXw9fRh195cQfaUO2"
+            openai_api_key = "sk-proj-utwYZXwGAgD2kpygKAQIT3BlbkFJB9U9lluAod4BZAWFCVG1"
             openai_api_base = self.vllm_server
             self.llm_client = OpenAI(
                 api_key=openai_api_key,
@@ -180,16 +182,11 @@ class MyRAGModel:
             self.tokenizer = self.llm.get_tokenizer()
 
         # Load a sentence transformer model optimized for sentence embeddings, using CUDA if available.
-        self.sentence_model = BGEM3FlagModel('BAAI/bge-m3',  
-            use_fp16=True,
+        self.sentence_model = SentenceTransformer(
+            "all-MiniLM-L6-v2",
             device=torch.device(
                 "cuda" if torch.cuda.is_available() else "cpu"
             ),
-        )
-        self.reranker = FlagReranker(
-            'BAAI/bge-reranker-v2-m3', 
-            use_fp16=True,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
 
     def calculate_embeddings(self, sentences):
@@ -206,17 +203,11 @@ class MyRAGModel:
             np.ndarray: An array of normalized embeddings for the given sentences.
 
         """
-        # print(sentences[:5])
-        # print(len(sentences))
-        # Ensure chunks is a list of strings
-        if not isinstance(sentences, list):
-            raise ValueError(f"Expected chunks to be a list of strings, got {type(sentences)}")
-        if not all(isinstance(chunk, str) for chunk in sentences):
-            raise ValueError("All elements in chunks must be strings.")
         embeddings = self.sentence_model.encode(
-            sentences,
-            batch_size=SENTENTENCE_TRANSFORMER_BATCH_SIZE
-        )['dense_vecs']
+            sentences=sentences,
+            normalize_embeddings=True,
+            batch_size=SENTENTENCE_TRANSFORMER_BATCH_SIZE,
+        )
         # Note: There is an opportunity to parallelize the embedding generation across 4 GPUs
         #       but sentence_model.encode_multi_process seems to interefere with Ray
         #       on the evaluation servers. 
@@ -224,7 +215,6 @@ class MyRAGModel:
         #       
         return embeddings
 
-    
     def get_batch_size(self) -> int:
         """
         Determines the batch size that is used by the evaluator when calling the `batch_generate_answer` function.
@@ -274,38 +264,37 @@ class MyRAGModel:
             batch_interaction_ids, batch_search_results
         )
 
-#         # Calculate all chunk embeddings
-#         chunk_embeddings = self.calculate_embeddings(chunks)
+        # Calculate all chunk embeddings
+        chunk_embeddings = self.calculate_embeddings(chunks)
 
-#         # Calculate embeddings for queries
-#         query_embeddings = self.calculate_embeddings(queries)
-
-        chunk_documents = [Document(page_content=chunk) for chunk in chunks]
-        self.vector_db.add_documents(chunk_documents)
+        # Calculate embeddings for queries
+        query_embeddings = self.calculate_embeddings(queries)
 
         # Retrieve top matches for the whole batch
         batch_retrieval_results = []
-        for query in queries:
-            retrieval_results = self.vector_db.similarity_search(
-                query=query,
-                k=NUM_CONTEXT_SENTENCES
-            )
+        for _idx, interaction_id in enumerate(batch_interaction_ids):
+            query = queries[_idx]
+            query_time = query_times[_idx]
+            query_embedding = query_embeddings[_idx]
+
+            # Identify chunks that belong to this interaction_id
+            relevant_chunks_mask = chunk_interaction_ids == interaction_id
+
+            # Filter out the said chunks and corresponding embeddings
+            relevant_chunks = np.array([chunk for i, chunk in enumerate(chunks) if relevant_chunks_mask[i]])
+            relevant_chunks_embeddings = chunk_embeddings[relevant_chunks_mask]
+
+            # Calculate cosine similarity between query and chunk embeddings,
+            cosine_scores = (relevant_chunks_embeddings * query_embedding).sum(1)
+
+            # and retrieve top-N results.
+            retrieval_results = relevant_chunks[
+                (-cosine_scores).argsort()[:NUM_CONTEXT_SENTENCES]
+            ]
             
-            retrieval_texts = [result.page_content for result in retrieval_results]
-            retrieved_chunks = [result[0].page_content for result in retrieval_results]
-            retrieved_scores = [result[1] for result in retrieval_results]
-
-            scores = []
-            for chunk in retrieved_chunks:
-                score = self.reranker.compute_score([query, chunk], normalize=True)
-                scores.append(score)
-
-            scores = -1 * np.array(scores)  
-            sorted_indices = scores.argsort()[:NUM_CONTEXT_SENTENCES2]
-
-            reranked_results = [retrieved_chunks[i] for i in sorted_indices]
-            batch_retrieval_results.append(retrieval_texts)
-            
+            # You might also choose to skip the steps above and 
+            # use a vectorDB directly.
+            batch_retrieval_results.append(retrieval_results)
             
         # Prepare formatted prompts from the LLM        
         formatted_prompts = self.format_prompts(queries, query_times, batch_retrieval_results)
@@ -335,7 +324,9 @@ class MyRAGModel:
                 ),
                 use_tqdm=False
             )
-            answers = [response.outputs[0].text for response in responses]
+            answers = []
+            for response in responses:
+                answers.append(response.outputs[0].text)
 
         return answers
 
@@ -348,7 +339,7 @@ class MyRAGModel:
         - query_times (List[str]): A list of query_time strings corresponding to each query.
         - batch_retrieval_results (List[str])
         """        
-        system_prompt = "You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible. Only If the references do not contain the necessary information to answer the question, respond with 'I don't know'. There is no need to explain the reasoning behind your answers."
+        system_prompt = "You are provided with a question and various references. Your task is to answer the question succinctly, using the fewest words possible. If the references do not contain the necessary information to answer the question, respond with 'I don't know'. There is no need to explain the reasoning behind your answers."
         formatted_prompts = []
 
         for _idx, query in enumerate(queries):
