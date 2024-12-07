@@ -92,14 +92,19 @@ if __name__ == "__main__":
 
     parser.add_argument("--model_name", type=str, default="vanilla_baseline",
                         choices=["vanilla_baseline",
-                                 "rag_baseline"
-                                 # add your model here
+                                 "rag_baseline",
+                                 "rag_baseline_chunked",
+                                 "rag_baseline_embedding",
+                                 "modified_rag",
+                                 "modified_rag_classification"
                                  ],
                         )
 
     parser.add_argument("--llm_name", type=str, default="meta-llama/Llama-3.2-3B-Instruct",
                         choices=["meta-llama/Llama-3.2-3B-Instruct",
                                  "google/gemma-2-2b-it",
+                                 "gpt-4",
+                                 "gpt-4o-mini"
                                  # can add more llm models here
                                  ])
     parser.add_argument("--is_server", action="store_true", default=True,
@@ -130,6 +135,18 @@ if __name__ == "__main__":
     elif model_name == "rag_baseline":
         from rag_baseline import RAGModel
         model = RAGModel(llm_name=llm_name, is_server=args.is_server, vllm_server=args.vllm_server)
+    elif model_name == "rag_baseline_chunked":
+        from rag_baseline_chunked import RAGModel
+        model = RAGModel(llm_name=llm_name, is_server=args.is_server, vllm_server=args.vllm_server)
+    elif model_name == "rag_baseline_embedding":
+        from rag_baseline_embedding import RAGModel
+        model = RAGModel(llm_name=llm_name, is_server=args.is_server, vllm_server=args.vllm_server)
+    elif model_name == "modified_rag":
+        from modified_rag import MyRAGModel
+        model = MyRAGModel(llm_name=llm_name, is_server=args.is_server, vllm_server=args.vllm_server)
+    elif model_name == "modified_rag_classification":
+        from modified_rag_classification import MyRAGModel
+        model = MyRAGModel(llm_name=llm_name, is_server=args.is_server, vllm_server=args.vllm_server)
     # elif model_name == "your_model":
     #     add your model here
     else:

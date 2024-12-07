@@ -79,13 +79,17 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="vanilla_baseline",
                         choices=["vanilla_baseline",
                                  "rag_baseline",
-                                 "modified_rag"
+                                 "rag_baseline_chunked",
+                                 "rag_baseline_embedding",
+                                 "modified_rag",
+                                 "modified_rag_classification"
                                  ],
                         )
 
     parser.add_argument("--llm_name", type=str, default="meta-llama/Llama-3.2-3B-Instruct",
                         choices=["meta-llama/Llama-3.2-3B-Instruct",
                                  "google/gemma-2-2b-it",
+                                 "gpt-4o-mini"
                                  ])
     parser.add_argument("--is_server", action="store_true", default=False,
                         help="Whether we use vLLM deployed on a server or offline inference.")
@@ -104,6 +108,7 @@ if __name__ == "__main__":
 
     llm_name = args.llm_name
     _llm_name = llm_name.split("/")[-1]
+
 
     # init evaluation model
     from evaluation_model import EvaluationModel
